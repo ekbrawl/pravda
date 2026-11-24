@@ -8,7 +8,7 @@ from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 TOKEN = "9192313074:AAHh3Fs4OaruOoK0rU9tcK1L2pORXZC459k"
-ADMIN_IDS = {0}  # <-- ЗАМЕНИ 0 НА СВОЙ ЧИСЛОВОЙ TELEGRAM ID, например {123456789}
+ADMIN_IDS = {1071268617}
 
 MAX_SKIPS = 3
 COOLDOWN_TURNS = 15
@@ -75,10 +75,8 @@ def parse_bulk_items(raw_text: str) -> list[str]:
         cleaned = line.strip()
         if not cleaned:
             continue
-        # На случай если строка начинается с /add_truths или /add_dares
         if cleaned.startswith("/add_truths") or cleaned.startswith("/add_dares"):
             continue
-        # Убираем случайные квадратные скобки по краям строки, если остались
         if cleaned.startswith("[") and cleaned.endswith("]") and len(cleaned) > 2:
             cleaned = cleaned[1:-1].strip()
         if cleaned:
@@ -173,7 +171,6 @@ async def start_admin_upload(message: types.Message, category: str):
         await message.answer("⛔ Эта команда доступна только администратору бота.")
         return
 
-    # Если текст был передан сразу в том же сообщении после команды — парсим сразу
     parts = message.text.split(maxsplit=1) if message.text else []
     if len(parts) > 1 and parts[1].strip():
         await process_admin_items(message, category, parts[1])
@@ -481,5 +478,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-     
