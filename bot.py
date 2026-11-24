@@ -1,31 +1,93 @@
 import asyncio
+import json
+import os
 import random
+import re
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 TOKEN = "9192313074:AAHh3Fs4OaruOoK0rU9tcK1L2pORXZC459k"
+ADMIN_IDS = {0}  # <-- ЗАМЕНИ 0 НА СВОЙ ЧИСЛОВОЙ TELEGRAM ID, например {123456789}
+
 MAX_SKIPS = 3
-COOLDOWN_TURNS = 15  # Через сколько собственных ходов игрока задание вернётся в пул
+COOLDOWN_TURNS = 15
+TASKS_FILE = "tasks.json"
+
+DEFAULT_TASKS = {
+    "truths": [
+        "Какой самый кринжовый поступок ты совершал в этом году?",
+        "Кому из присутствующих в чате ты бы доверил свой разблокированный телефон на час?",
+        "О чём ты соврал в последний раз?",
+        "Какая самая странная вещь есть в твоей истории поиска?",
+    ],
+    "dares": [
+        "Запиши кружочек в этот чат, где ты с максимально серьёзным лицом читаешь рэп 15 секунд.",
+        "Поставь на аватарку в ТГ фото, которое выберет следующий игрок, на 2 часа.",
+        "Отправь голосовое с пародией на кого-то из этой компании.",
+        "Напиши любому человеку из списка контактов «Я всё знаю» и скинь скрин ответа.",
+    ],
+}
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-TRUTHS = [
-    "Какой самый кринжовый поступок ты совершал в этом году?",
-    "Кому из присутствующих в чате ты бы доверил свой разблокированный телефон на час?",
-    "О чём ты соврал в последний раз?",
-    "Какая самая странная вещь есть в твоей истории поиска?",
-]
+# Состояние ожидания пачки заданий от админа в личке: user_id -> "truths" | "dares"
+pending_admin_upload: dict[int, str] = {}
+games: dict[int, dict] = {}
 
-DARES = [
-    "Запиши кружочек в этот чат, где ты с максимально серьёзным лицом читаешь рэп 15 секунд.",
-    "Поставь на аватарку в ТГ фото, которое выберет следующий игрок, на 2 часа.",
-    "Отправь голосовое с пародией на кого-то из этой компании.",
-    "Напиши любому человеку из списка контактов «Я всё знаю» и скинь скрин ответа.",
-]
 
-games = {}
+def load_tasks() -> dict[str, list[str]]:
+    if not os.path.exists(TASKS_FILE):
+        save_tasks(DEFAULT_TASKS)
+        return {
+            "truths": list(DEFAULT_TASKS["truths"]),
+            "dares": list(DEFAULT_TASKS["dares"]),
+        }
+    with open(TASKS_FILE, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    truths = [str(x).strip() for x in data.get("truths", []) if str(x).strip()]
+    dares = [str(x).strip() for x in data.get("dares", []) if str(x).strip()]
+    return {"truths": truths, "dares": dares}
+
+
+def save_tasks(data: dict[str, list[str]]) -> None:
+    with open(TASKS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+tasks_db = load_tasks()
+
+
+def parse_bulk_items(raw_text: str) -> list[str]:
+    """
+    Парсит текст пачкой:
+    - Если есть фрагменты в квадратных скобках [вопрос], извлекает их все (даже если на одной строке несколько).
+    - Если скобок нет, разбивает по строкам и убирает пустые строки.
+    """
+    bracket_matches = re.findall(r"\[([^\[\]]+?)\]", raw_text, flags=re.DOTALL)
+    if bracket_matches:
+        items = [re.sub(r"\s+", " ", m).strip() for m in bracket_matches]
+        return [item for item in items if item]
+
+    lines = []
+    for line in raw_text.splitlines():
+        cleaned = line.strip()
+        if not cleaned:
+            continue
+        # На случай если строка начинается с /add_truths или /add_dares
+        if cleaned.startswith("/add_truths") or cleaned.startswith("/add_dares"):
+            continue
+        # Убираем случайные квадратные скобки по краям строки, если остались
+        if cleaned.startswith("[") and cleaned.endswith("]") and len(cleaned) > 2:
+            cleaned = cleaned[1:-1].strip()
+        if cleaned:
+            lines.append(cleaned)
+    return lines
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def get_mode_kb():
@@ -66,13 +128,15 @@ def pick_task(game: dict, player_id: int, choice: str) -> str:
     p_state = game["players"][player_id]
     current_turn = p_state["turns"]
 
-    # Снимаем кулдаун с заданий, у которых подошёл срок (unlock_turn <= current_turn)
     cooldowns = p_state["cooldowns"]
     expired = [task for task, unlock_turn in cooldowns.items() if unlock_turn <= current_turn]
     for task in expired:
         del cooldowns[task]
 
-    pool = TRUTHS if choice == "truth" else DARES
+    pool = tasks_db["truths"] if choice == "truth" else tasks_db["dares"]
+    if not pool:
+        return "⚠️ В базе пока нет заданий этого типа. Админ может добавить их в личке через /add_truths или /add_dares."
+
     available = [
         t for t in pool
         if t not in cooldowns and t not in p_state["seen_in_session"]
@@ -99,6 +163,131 @@ def pick_task(game: dict, player_id: int, choice: str) -> str:
         f"— <i>{task}</i>"
     )
 
+
+# --- АДМИН-КОМАНДЫ (ТОЛЬКО В ЛИЧКЕ С БОТОМ) ---
+
+async def start_admin_upload(message: types.Message, category: str):
+    if message.chat.type != "private":
+        return
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Эта команда доступна только администратору бота.")
+        return
+
+    # Если текст был передан сразу в том же сообщении после команды — парсим сразу
+    parts = message.text.split(maxsplit=1) if message.text else []
+    if len(parts) > 1 and parts[1].strip():
+        await process_admin_items(message, category, parts[1])
+        return
+
+    pending_admin_upload[message.from_user.id] = category
+    title = "ПРАВДУ" if category == "truths" else "ДЕЙСТВИЯ"
+    await message.answer(
+        f"✍️ Режим добавления в раздел <b>{title}</b> включён.\n\n"
+        f"Скинь следующим сообщением пачку заданий (хоть 20 строк сразу). Можно в квадратных скобках:\n"
+        f"<code>[Первый вопрос]\n[Второй вопрос]</code>\n"
+        f"или просто каждый пункт с новой строки.",
+        parse_mode="HTML",
+    )
+
+
+async def process_admin_items(message: types.Message, category: str, raw_text: str):
+    new_items = parse_bulk_items(raw_text)
+    if not new_items:
+        await message.answer("⚠️ Не удалось распознать ни одного задания. Проверь текст и отправь снова.")
+        return
+
+    existing_set = set(tasks_db[category])
+    added = []
+    skipped_dupes = 0
+
+    for item in new_items:
+        if item not in existing_set:
+            tasks_db[category].append(item)
+            existing_set.add(item)
+            added.append(item)
+        else:
+            skipped_dupes += 1
+
+    save_tasks(tasks_db)
+    title = "Правда" if category == "truths" else "Действия"
+    preview = "\n".join(f"• {x}" for x in added[:10])
+    more_note = f"\n<i>...и ещё {len(added) - 10} шт.</i>" if len(added) > 10 else ""
+    dupe_note = f"\n⏭ Пропущено дублей: {skipped_dupes}" if skipped_dupes else ""
+
+    await message.answer(
+        f"✅ Добавлено в раздел <b>{title}</b>: <b>{len(added)}</b> шт. (всего в базе: {len(tasks_db[category])})\n"
+        f"{preview}{more_note}{dupe_note}",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("add_truths"))
+async def cmd_add_truths(message: types.Message):
+    await start_admin_upload(message, "truths")
+
+
+@dp.message(Command("add_dares"))
+async def cmd_add_dares(message: types.Message):
+    await start_admin_upload(message, "dares")
+
+
+@dp.message(Command("tasks_info"))
+async def cmd_tasks_info(message: types.Message):
+    if message.chat.type != "private" or not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        f"📊 <b>База заданий ({TASKS_FILE}):</b>\n"
+        f"• Правда: <b>{len(tasks_db['truths'])}</b>\n"
+        f"• Действия: <b>{len(tasks_db['dares'])}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("clear_tasks"))
+async def cmd_clear_tasks(message: types.Message):
+    if message.chat.type != "private" or not is_admin(message.from_user.id):
+        return
+    args = (message.text or "").split()
+    if len(args) < 2 or args[1].lower() not in ("truth", "truths", "dare", "dares", "all"):
+        await message.answer(
+            "Используй:\n"
+            "<code>/clear_tasks truth</code> — очистить Правду\n"
+            "<code>/clear_tasks dare</code> — очистить Действия\n"
+            "<code>/clear_tasks all</code> — очистить оба раздела",
+            parse_mode="HTML",
+        )
+        return
+
+    target = args[1].lower()
+    if target in ("truth", "truths", "all"):
+        tasks_db["truths"].clear()
+    if target in ("dare", "dares", "all"):
+        tasks_db["dares"].clear()
+    save_tasks(tasks_db)
+    await message.answer("🗑 Выбранный раздел очищен.")
+
+
+@dp.message(F.chat.type == "private", F.text)
+async def handle_private_text(message: types.Message):
+    user_id = message.from_user.id
+    if not is_admin(user_id):
+        return
+    category = pending_admin_upload.pop(user_id, None)
+    if not category:
+        await message.answer(
+            "👋 Привет, админ! Команды для загрузки в личке:\n"
+            "• <code>/add_truths</code> — добавить вопросы (Правда)\n"
+            "• <code>/add_dares</code> — добавить задания (Действие)\n"
+            "• <code>/tasks_info</code> — статистика базы\n"
+            "• <code>/clear_tasks truth|dare|all</code> — очистка",
+            parse_mode="HTML",
+        )
+        return
+
+    await process_admin_items(message, category, message.text)
+
+
+# --- ИГРОВАЯ ЛОГИКА (ГРУППОВЫЙ ЧАТ) ---
 
 @dp.message(Command("newgame"))
 async def cmd_newgame(message: types.Message):
@@ -292,3 +481,5 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+     
